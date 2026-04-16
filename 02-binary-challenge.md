@@ -1,328 +1,254 @@
 # 02 — Binary Challenges (ETH / CADUSD / NZDUSD / CHFUSD / XAGUSD, 1h)
 
-Five parallel binary‑direction challenges. The simplest and best entry point to understand the MANTIS scoring recipe, because all the more complex challenges are variations of this pattern.
+Five parallel binary‑direction challenges. The simplest and best entry point.
 
 | Property | Value |
 |---|---|
 | **Tickers** | `ETH`, `CADUSD`, `NZDUSD`, `CHFUSD`, `XAGUSD` |
-| **Loss function key** | `binary` |
-| **Embedding dim** | `2` |
-| **Horizon (`blocks_ahead`)** | `300` blocks ≈ 1 hour |
-| **Challenge weight** (each) | `1.0` (5 × 1.0 total) |
+| **Embedding dim** | `2` (two numbers per sample) |
+| **Horizon** | `300` blocks ≈ 1 hour |
+| **Weight** (each) | `1.0` |
 | **Scorer** | `salience_binary_prediction()` in `model.py` |
 
 ---
 
 ## 1. What you are predicting
 
-**Direction of the next 1‑hour return** on that ticker:
+Will the price go **up** over the next 1 hour?
 
-\[
-y_t = \mathbf{1}\![\, r_{t \to t+H} > 0 \,], \qquad H = 300 \text{ blocks}
-\]
-
-A price went up → label `1`. Went down → label `0`. Ties are treated as zero (via `RET_EPS = 0.0`).
-
-Note: `y` must have both classes present in the window, otherwise the scorer returns no salience.
+- `y = 1` if the price is higher 300 blocks from now.
+- `y = 0` if the price is lower or equal.
 
 ---
 
 ## 2. What you submit
 
-A **2‑dimensional vector** per ticker, every sample. Each component must be in \([-1, 1]\).
+A **2‑number vector per ticker, every ~60 seconds**. Each number in `[-1, 1]`.
 
 ```python
-embeddings["ETH"] = [0.3, -0.1]        # your 2 features
+embeddings["ETH"]    = [0.3, -0.1]
 embeddings["CADUSD"] = [-0.5, 0.2]
-embeddings["NZDUSD"] = [0.0, 0.0]
+embeddings["NZDUSD"] = [0.0, 0.1]
 embeddings["CHFUSD"] = [0.1, 0.1]
 embeddings["XAGUSD"] = [-0.2, 0.4]
 ```
 
-These are **features**, not probabilities. They are fed straight into a per‑miner L2 logistic regression. They do not need to sum to anything.
+These are **features**, not probabilities. They don't need to sum to anything. The validator feeds them straight into a logistic regression and lets the regression figure out how to combine them.
 
 ---
 
-## 3. Key vocabulary (read this first)
+## 3. Where does the embedding come from? (the base source)
 
-Before the scoring walkthrough, pin down the variables. The code uses these exact letters.
+The **only raw data you need** is a **time series of recent prices** for the ticker. Nothing else is mandatory.
 
-| Symbol | Meaning | Typical value |
+From that single price stream, you compute **two numbers** that hopefully predict the next 1‑hour direction. Common choices:
+
+| Feature idea | Formula (simple) | What it captures |
 |---|---|---|
-| `T` | **Number of valid samples** in the training window (rows of `X_flat` / `y`). One sample per `SAMPLE_EVERY = 5` blocks ≈ 60 s. | e.g. at 60 days × 1440 samples/day = **86 400**; minimum **500** to run |
-| `H` | **Number of hotkeys (miners)** seen in the window | up to `NUM_UIDS = 256` |
-| `D` | **Embedding dim** for the challenge | `2` for binary |
-| `H_steps` | **Horizon in samples** (`round(blocks_ahead / SAMPLE_EVERY)`) | `300/5 = 60` |
-| `LAG` | **Embargo in samples** between the end of training and the start of validation. Prevents the forward‑looking label from leaking into training. | `60` |
-| `CHUNK_SIZE` | Length (in samples) of each walk‑forward **validation segment** | `4000` |
-| `TOP_K` | Miners surviving feature selection | `50` |
-| `sel_split` | Feature‑selection split point (`T // 2`) | half of `T` |
-| `tw` | Per‑sample **time weight**, exponentially decayed with half‑life `HALFLIFE_DAYS = 15`. Mean‑normalized to 1. | array of length `T` |
+| Short‑term momentum | `(P_now − P_10min_ago) / P_10min_ago`, clipped to `[-1, 1]` | Recent direction |
+| Longer momentum | `(P_now − P_1h_ago) / P_1h_ago` | Hourly trend |
+| Volatility regime | z‑score of rolling 1h return std | Calm vs. choppy market |
+| Mean reversion | z‑score of `P_now` vs. 4h moving average | Overbought / oversold |
 
-### What is AUC?
+You pick **any two** (or combine several into two), clip to `[-1, 1]`, and ship them as your 2‑number embedding.
 
-**AUC = Area Under the ROC Curve**, a standard binary‑classifier quality metric.
-
-- It is the probability that a **random positive sample gets a higher score** than a random negative sample, under the classifier.
-- `AUC = 0.5` → coin flip (no information).
-- `AUC = 1.0` → perfect ranker.
-- `AUC < 0.5` → systematically wrong (flip its sign and it becomes `1 − AUC`).
-
-MANTIS uses AUC instead of accuracy because:
-
-1. It is **threshold‑free** — miners submit raw features, not probabilities, so there is no natural 0/1 cutoff. AUC integrates over all possible thresholds.
-2. It is **robust to class imbalance** within a window (labels are not exactly 50/50).
-3. It gives a continuous number — the scorer can **rank** miners and keep the top `TOP_K`.
-
-AUC is computed via `sklearn.metrics.roc_auc_score` on the **held‑out second half** of `T` (see Step 2 below).
-
-### What is "L2 logistic" / "ElasticNet logistic"?
-
-- **L2 logistic:** logistic regression with a penalty `λ · ∑ β_j²`. Keeps coefficients small, spreads mass across correlated features — this is the **Sybil defense**.
-- **ElasticNet logistic:** penalty `λ · (α · ∑|β_j| + (1−α) · ∑ β_j²)` with `l1_ratio = 0.5`. The L1 term **zeros out uninformative miners**; the L2 term still spreads correlated ones.
-- `C` in scikit‑learn is `1/λ` (higher `C` = weaker penalty). Binary scorer uses `C = 0.5` for base models and `C = 1.0` for the meta‑model.
+That's it. You do not need book data, order flow, news, or anything fancy to start — you can upgrade later.
 
 ---
 
-## 4. How validators score you — exact walkthrough
+## 4. Simple vocabulary (the only letters you'll see)
 
-Everything below maps directly to lines in `salience_binary_prediction()` in `model.py`. Constants come from `config.py`.
+| Letter | Meaning | Example |
+|---|---|---|
+| `T` | How many samples of history the validator has. One sample = 60 s. | `T = 1000` ≈ 17 hours of history |
+| `H` | How many miners are in the pool. | `H = 4` miners |
+| `D` | Your embedding size. | `D = 2` for binary |
+| `AUC` | "How good is a classifier at ranking positives above negatives?" `0.5` = random, `1.0` = perfect. | `AUC = 0.62` means better than random |
 
-### Step 1 — Sanitize & assemble `X`, `y`
-
-```
-X_flat: (T, H*D)   →   nan_to_num(0)   →   reshape to X: (T, H, D=2)
-y:      (T,)       →   y_bin = (y > 0).astype(float32)
-```
-
-Guards that short‑circuit the scorer:
-
-1. `X_flat.shape[0] != y.shape[0]` → return `{}`.
-2. `T < 500` → return `{}` (not enough history).
-3. If `T > MAX_INDEX_HISTORY = MAX_DAYS * INDICES_PER_DAY` (60 days × 1440 = 86 400), trim to the **last 86 400 samples** on both `X_flat` and `y`.
-4. `y_bin` must contain both `0` and `1` in the window (`len(np.unique(y_bin)) >= 2`).
-
-A `first_nz_idx[j]` is computed per miner = the first sample where miner `j` submitted a non‑zero vector. Samples before activation are **not counted against the miner**.
-
-### Step 2 — Feature selection via held‑out AUC
-
-```
-sel_split = T // 2
-```
-
-For **each miner `j`** independently:
-
-1. **Fit** an L2 logistic on `X[:sel_split, j, :]` restricted to rows where miner `j` actually submitted (`mask_fit`), with:
-   - `penalty = "l2"`, `C = 0.5`, `class_weight = "balanced"`, solver `liblinear` (D ≤ 4), `max_iter = 100`.
-   - `sample_weight = tw[:sel_split][mask_fit]` — recent‑biased.
-2. **Evaluate** on `X[sel_split:, j, :]`, restricted to rows where the miner submitted AND both classes exist in `y_bin[sel_split:]`. Requirement: at least **20 valid held‑out samples**.
-3. Record `sel_auc[j] = roc_auc_score(y_bin_eval, decision_function(X_eval))`.
-
-Miners that do not meet the data requirements get a default `sel_auc[j] = 0.5` (will be dropped).
-
-**Selection rule:** sort by `sel_auc` descending, keep the top `min(TOP_K=50, H)` indices whose AUC is **strictly > 0.5**. If nothing survives → return `{}`.
-
-This step alone kills spammers, constants, and noise miners *before* they ever enter the expensive walk‑forward or the meta‑model.
-
-### Step 3 — Walk‑forward OOS predictions (the validation engine)
-
-This is the part most worth reading carefully.
-
-**Segments are built by `_build_oos_segments(fit_end_exclusive=T, chunk=4000, lag=60)`.** The loop:
-
-```python
-start = 0
-while True:
-    val_start = start + LAG             # = start + 60
-    if val_start >= T: break
-    end = min(start + CHUNK_SIZE, T)    # = min(start + 4000, T)
-    if end <= val_start: break
-    segments.append((start, val_start, end))
-    start = end
-```
-
-So the segments look like:
-
-| segment | `seg_start` | `seg_val_start` | `seg_val_end` |
-|---|---:|---:|---:|
-| 0 | 0 | 60 | 4000 |
-| 1 | 4000 | 4060 | 8000 |
-| 2 | 8000 | 8060 | 12 000 |
-| … | … | … | … |
-
-Then for **each selected miner `j`** and **each segment**:
-
-```python
-fit_end = max(0, seg_val_start - LAG)   # the training cutoff
-```
-
-- Segment 0: `fit_end = 60 - 60 = 0` → training data is empty → segment skipped (`fit_end < MIN_BASE_TRAIN = 50`).
-- Segment 1: `fit_end = 4060 - 60 = 4000` → **train on `X[:4000, j, :]`, validate on `[4060 : 8000]`**.
-- Segment 2: `fit_end = 8060 - 60 = 8000` → train on `X[:8000, j, :]`, validate on `[8060 : 12000]`.
-- …and so on.
-
-This is an **expanding‑window walk‑forward**: training always starts at index 0 and grows each segment; validation is always the *new* `CHUNK_SIZE − LAG` window ahead, separated from training by a 60‑sample embargo.
-
-For each segment, the miner‑specific base model:
-
-- Trains L2 logistic on `mask_fit` rows (miner submitted, both classes present, ≥ `MIN_BASE_TRAIN = 50` samples).
-- Produces OOS scores on `mask_oos` rows via `decision_function`.
-- Writes those scores into `X_oos[seg_val_start:seg_val_end, col(j)]`. Rows where the miner did not submit stay `NaN`.
-
-Key consequences:
-
-- Each miner ends up with a sparse column of **true out‑of‑sample predictions** across the timeline.
-- Because fit windows expand, recent‑segment base models see the whole history — which is fine because `sample_weight = tw` down‑weights old data.
-- Embargo = `LAG = 60` = one hour of samples. The label horizon is also 60 samples (`H_steps = 300/5`), so training is always at least one full horizon away from validation → **no label leakage**.
-
-### Step 4 — Meta‑model (ElasticNet logistic over all miners)
-
-Now the meta‑model is fit **once** on the OOS prediction matrix `X_oos`:
-
-- Rows: all `t` where at least one selected miner has a non‑NaN OOS value (`row_has_any`).
-- Missing values are replaced with `0.0` (neutral).
-- Requirement: at least `MIN_META_TRAIN_ROWS = 50` usable rows **and** both classes in `y`.
-- Settings:
-  - `penalty = "elasticnet"`, `l1_ratio = 0.5`
-  - `C = 1.0`, solver `saga`, `max_iter = 2000`, `tol = 1e-4`
-  - `class_weight = "balanced"`
-  - `sample_weight = tw` — recency‑biased
-
-The ElasticNet penalty is where **Sybil resistance** actually lives:
-
-- **L1 half** pushes the coefficients of miners whose OOS predictions are not linearly predictive (over the full window) to **exactly zero**.
-- **L2 half** shares coefficient mass across near‑duplicate columns. If 3 miners submit the same features, the meta‑model assigns each of them ≈ 1/3 of what a single unique miner would get.
-
-### Step 5 — Salience → dictionary
-
-```python
-coef_vec = np.abs(meta_clf.coef_).ravel()   # shape (K,)
-imp[hk_j] = coef_vec[local_col(j)]
-total    = sum(imp.values())
-return   = {hk: v / total for hk, v in imp.items()}
-```
-
-The returned dict contains **only the `TOP_K` miners that survived feature selection**; every other miner gets 0 for this ticker in the challenge aggregation. The dict sums to 1 and is then weighted by `challenge.weight = 1.0` in `multi_salience()`.
+That's the whole vocabulary. Everything else is a side effect.
 
 ---
 
-## 5. Why this recipe?
+## 5. Validation logic — a worked example
 
-- **Feature selection first** → prevents one bad miner’s features from drowning out good ones in the meta‑model, and keeps the ElasticNet fit small (50 columns vs. potentially 256).
-- **Walk‑forward OOS** → every meta‑model input is a true out‑of‑sample prediction; leakage through the horizon is bounded by `LAG = 60`.
-- **ElasticNet (L1 + L2)** → the L1 piece zeros out uninformative miners; the L2 piece splits coefficient mass among correlated/duplicated miners (the Sybil defense).
-- **Recency weighting (`tw`, half‑life 15 days)** → the market is non‑stationary; recent samples matter more.
-- **\(|\beta_j|\) as salience** → a direct measure of "how much this miner’s prediction moves the meta‑model decision".
+Let's invent **four virtual miners** and run them through the real validator code step by step.
+
+### Setup
+
+- Ticker: `ETH`. Horizon: 1 hour (60 samples).
+- Validator has collected `T = 1000` samples of ETH history.
+- Four miners submitted an embedding at every sample:
+
+| Miner | Strategy | ETH embedding at sample `t` |
+|---|---|---|
+| **Alice** | Momentum + volatility — a *real* model | `[momentum_t, vol_z_t]` |
+| **Bob**   | Random noise | `[rand(-1,1), rand(-1,1)]` |
+| **Charlie** | Lazy — never changes | `[0.0, 0.0]` |
+| **Dave** | Sybil — **copies Alice's exact numbers** | `[momentum_t, vol_z_t]` (identical to Alice) |
+
+Suppose the first 1000 samples really did happen like this:
+
+- Price went up over the next hour **540 times** → `y = 1`.
+- Price went down or stayed flat **460 times** → `y = 0`.
+
+### Step 1 — Build the input matrix
+
+The validator stacks everyone's embeddings into a big array:
+
+```
+X has shape (T=1000 samples, H=4 miners, D=2 features)
+y has shape (1000,)  →  540 ones, 460 zeros
+```
+
+Sanity checks the validator does:
+- `T ≥ 500`? Yes. ✓
+- Are both `0` and `1` present in `y`? Yes. ✓
+
+If either fails, it just returns `{}` — no salience computed this round.
+
+### Step 2 — Feature selection (who survives?)
+
+The validator asks: *"Can miner j's two numbers, on their own, predict direction better than random?"*
+
+For **each miner independently**:
+
+1. Split `T` in half → first 500 samples = **train**, last 500 samples = **test**.
+2. Fit a tiny L2 logistic regression using only that miner's 2 features on the train half.
+3. Score the test half. Compute **AUC**.
+
+Hypothetical AUC results:
+
+| Miner | AUC on test half | Pass? |
+|---|---:|---|
+| **Alice**   | **0.62** | ✓ beats 0.5 → **survives** |
+| **Bob**     | 0.49 | ✗ worse than random → **dropped** |
+| **Charlie** | 0.50 | ✗ (constants can't classify) → **dropped** |
+| **Dave**    | **0.62** | ✓ (identical to Alice) → **survives** |
+
+Rule in code: keep the **top 50 miners with AUC > 0.5**. Here only 2 survive: **Alice and Dave**.
+
+> Intuition: AUC = 0.62 means *"If you pick one random sample where the price went up, and one where it went down, Alice's prediction ranks the up‑one higher **62% of the time**."* That's a real, small edge — plenty to survive.
+
+### Step 3 — Walk‑forward out‑of‑sample predictions
+
+Now for every surviving miner, the validator builds a column of **honest, never‑seen‑before predictions** across the timeline. This is the "walk‑forward" part.
+
+It chops the timeline into segments and, for each segment, *retrains* each miner's tiny logistic using only past data, with a **60‑sample embargo** (an hour gap) before the test window:
+
+```
+Segment 1:  TRAIN on samples 0..3999         →  TEST on 4060..8000
+Segment 2:  TRAIN on samples 0..7999         →  TEST on 8060..12000
+Segment 3:  TRAIN on samples 0..11999        →  TEST on 12060..16000
+...
+```
+
+With our toy `T = 1000` only one short segment fits, but the principle is the same. For Alice, the validator might produce 940 out‑of‑sample scores like:
+
+```
+X_oos[:, Alice]  =  [0.11, -0.35, 0.62, 0.08, ..., -0.22]   # 940 numbers
+X_oos[:, Dave ]  =  [0.11, -0.35, 0.62, 0.08, ..., -0.22]   # identical!
+```
+
+Why the embargo? The label at sample `t` *looks 60 samples into the future*. If you trained right up to sample `t`, the model could accidentally learn from those future points. The 60‑sample gap prevents that leak.
+
+### Step 4 — The meta‑model (the key step for fairness)
+
+Now the validator fits **one** final logistic regression across **all surviving miners at once**:
+
+```
+input  :  X_oos  (the columns from Step 3, one per surviving miner)
+target :  y      (did the price actually go up?)
+model  :  ElasticNet logistic regression (L1 + L2 penalty)
+```
+
+It learns coefficients `β` — one per miner — that say **how much to trust each miner** when mixed together.
+
+Here is the magic. Imagine Alice alone would get `|β| = 0.80`. Because Dave submitted the **identical** column, the L2 penalty forces the coefficient mass to **split evenly between them**:
+
+| Miner | Coefficient `|β|` (solo) | Coefficient `|β|` (with a clone) |
+|---|---:|---:|
+| Alice | 0.80 | **0.40** |
+| Dave (clone) | — | **0.40** |
+
+Two clones do **not** earn twice as much — together they earn what one Alice would have earned. **That is the Sybil defense.**
+
+The L1 part of the penalty drives uninformative miners' coefficients to **exactly zero** (so even if Bob had sneaked through, his `β` would go to 0).
+
+### Step 5 — Turn coefficients into salience
+
+Take absolute values, normalize so they sum to 1:
+
+```
+imp["Alice"] = 0.40
+imp["Dave"]  = 0.40
+# --- sum = 0.80, divide each by 0.80 ---
+salience = {"Alice": 0.5, "Dave": 0.5}
+```
+
+Bob, Charlie, and every miner who didn't survive feature selection → **0**.
+
+This dict is the binary‑challenge salience for `ETH`. The validator repeats the whole process for each of the 5 tickers, multiplies each dict by `weight = 1.0`, averages them, EMA‑smooths, and pushes on‑chain.
 
 ---
 
 ## 6. What gets you zero weight
 
-- Submitting constants (e.g. `[0, 0]` forever) → feature‑selection AUC stays at 0.5 → dropped at Step 2.
-- Submitting random noise → AUC near 0.5 → dropped, or β near 0 under the L1 pressure.
-- Copying a top miner → correlated columns → L2 splits the coefficient mass; the clone cannot *add* weight.
-- Missing the ticker entirely → zero contribution for that challenge.
-- Submitting only during some windows → fewer `mask_fit`/`mask_oos` rows → coefficient estimate gets dominated by other miners and your `|β_j|` stays tiny.
+| Mistake | What happens |
+|---|---|
+| Submit constants (like Charlie) | AUC = 0.5 → dropped at Step 2 |
+| Submit random noise (like Bob) | AUC ≈ 0.5 → dropped, or `β` crushed to 0 |
+| Copy a top miner (like Dave) | Survive Step 2, but share coefficient → earn **half** of what you thought |
+| Miss the ticker | No column at all → `0` |
+| Submit only sometimes | Few rows → unstable `β` → small salience |
 
 ---
 
-## 7. My take — how to design the embedding generation pipeline
+## 7. My take — how to build a good miner
 
-This is **opinion, not spec** — but it follows directly from the validation logic above. I would build the miner embedding‑generation process as six layered stages, each with a single responsibility.
+Given that validation logic, here is the **minimum** pipeline that actually works. You can add complexity later.
 
-### Stage 1 — Data ingestion (the 60 s heartbeat)
+### What you need
 
-Every ~60 s you need fresh inputs for *all five tickers*. Do not couple this to the model.
+1. **A live price feed for each ticker.** Use the same source the validator uses if possible — spot for ETH, FX for the forex/metal pairs.
+2. **A small in‑memory rolling window** of the last ~24 hours of prices (more for a 6 h horizon).
+3. **A simple model that outputs two numbers every 60 seconds.**
 
-- Subscribe to tick data (or use 1 s bars) for ETH spot and the 4 forex/metal pairs from the same provider the validators trust. Mismatched data sources are a silent killer — your model trains on Polygon/Binance and the validator labels on whatever `price_service.py` published.
-- Maintain an in‑memory rolling window per ticker — about the last **24–72 hours** is enough for a 1 h forward classifier.
-- Timestamp every row with the **chain block number**, not wallclock — the validator aligns everything via `sidx`.
-
-### Stage 2 — Feature engineering (produce > 2 candidate signals)
-
-Although you only submit 2 values, you should compute **many candidate signals** and learn which 2 directions to project onto. Good starting points for a 1 h binary classifier:
-
-- Log‑return momentum at multiple lookbacks (5 min, 15 min, 1 h, 4 h).
-- Rolling realized volatility ratio (short / long).
-- RSI / z‑scored price against a rolling median.
-- Order‑flow imbalance proxy (if you have book data).
-- For forex/metals: DXY return, rates differential, London/NY session flag.
-
-Cache the feature matrix so Stage 3 is cheap.
-
-### Stage 3 — Offline training (once per day, not per sample)
-
-Train **one small model per ticker** — this is not where you need a transformer.
-
-- Model: L2 logistic regression, or gradient boosting with probability calibration.
-- Target: same label the validator uses — `y = 1[r_{t→t+300 blocks} > 0]`. Recreate it from your own price history with the same 300‑block horizon.
-- Use **walk‑forward CV** with an embargo at least `H_steps = 60` — mimic the validator.
-- Optimize on **held‑out AUC**, not accuracy. That is exactly what the validator uses in Step 2 of Section 4.
-
-Persist `(weights, scaler, feature_list)` to disk tagged with a version id.
-
-### Stage 4 — Online inference → 2‑dim projection
-
-At every sample, compute features and produce the **2‑dim embedding**. The submitted vector does not have to be a probability — it is a *feature* fed into another logistic. So any of these work:
-
-- `[logit(p_up), signed_confidence]` where `signed_confidence ∈ [-1, 1]` is e.g. `(p_up − 0.5) · 2`.
-- `[momentum_score, vol_regime_score]` — two independent signals with near‑zero correlation. This is my preference: **the validator’s per‑miner L2 logistic can *combine* both features**, so you get more expressive power than a single probability.
-- Clip every component to `[-1, 1]` (out‑of‑range values still work but your coefficient becomes unstable).
-
-**Anti‑pattern:** submitting `[p_up, 1 - p_up]`. These are perfectly collinear → `D = 2` collapses to `D = 1` in practice → wasted capacity.
-
-### Stage 5 — Payload build + upload (decouple from the model)
-
-Keep a strict boundary between "compute embedding" and "ship it".
-
-- A separate thread/coroutine picks up the latest embedding dict (all 5 tickers + LBFGS + the rest), calls `generate_v2(...)` with `lock_seconds ≈ 30–60`, and uploads the JSON to your R2 bucket under `object_key = hotkey`.
-- Overwrite the same object every cycle — validators always pull the latest.
-- If the model thread is late, **reuse the previous embedding** rather than skipping a sample. A stale prediction is still a prediction; a missing row is not.
-
-### Stage 6 — Monitoring & retrain loop
-
-You only know if the pipeline is working by what the validator sees.
-
-- Log: feature AUC on your own walk‑forward CV, embedding stats (mean/std per component per ticker), upload latency, binding‑hash success rate.
-- Alert on: embedding std < 1e‑3 for any component over the last hour (you just created a constant → feature selection will drop you).
-- Retrain nightly: pull the last 30–60 days of data, refit Stage 3 models, deploy behind a version flag.
-
-### Visual summary
+### The simplest working pipeline
 
 ```mermaid
 graph LR
-    A[Tick data /<br/>price feed] --> B[Feature store<br/>rolling window]
-    B --> C[Per-ticker model<br/>logistic / GBM]
-    C --> D[2-dim projector<br/>clip to -1..1]
-    D --> E[Embedding dict<br/>5 tickers + others]
-    E --> F[generate_v2<br/>X25519 + Drand tlock]
-    F --> G[Upload to R2<br/>key = hotkey]
-    G --> H[on-chain commit<br/>one-shot]
-
-    I[Nightly retrain] --> C
-    J[Monitor: std, AUC,<br/>upload latency] -. feedback .-> B
-    J -. feedback .-> C
+    A[Live price feed<br/>1 number per tick] --> B[Rolling window<br/>last 24h of prices]
+    B --> C[Compute features<br/>momentum + volatility z-score]
+    C --> D[Clip to -1..1<br/>2 numbers out]
+    D --> E[Embedding dict<br/>one entry per ticker]
+    E --> F[Ship every 60s]
 ```
 
-**Why this structure?** It matches what the validator actually rewards:
+### My opinionated advice
 
-- Stage 2–3 maximize per‑miner AUC → you survive **Step 2** feature selection.
-- Stage 4 produces *independent* features → you contribute unique signal to the meta‑model in **Step 4**, which means a bigger `|β_j|`.
-- Stage 5–6 guarantee continuous, non‑constant, correctly‑bound submissions → you never fall out for operational reasons.
+- **Start with two *independent* features, not two versions of the same thing.** E.g. short‑term momentum + volatility regime. Submitting `[p, 1-p]` is the worst thing you can do — it's really only *one* number, and wastes half your capacity.
+- **Clip your outputs to `[-1, 1]`.** The validator doesn't care about scale but extreme values make your coefficient unstable.
+- **Submit every single cycle.** Even if your model hasn't changed, re‑send the previous value. A missing sample just becomes a gap in the validator's view of you.
+- **Don't copy other miners.** The L2 split is automatic — you will literally split your reward with them.
+- **Match the label.** When you train your own model, use `y = 1 if price goes up over 300 blocks (1 hour)`. Same label as the validator. No surprises.
+- **Forget about being fancy until the basics work.** A clean momentum + volatility setup that runs every 60 s and survives feature selection beats a brilliant model that ships late once a day.
 
-You can skip any of Stages 2–3 and still mine, but you will be competing against miners who don’t.
+### Why that order?
+
+- Features that *actually* predict 1h direction → you pass **Step 2 feature selection** (survive AUC > 0.5).
+- Independent features → your per‑miner logistic in **Step 3** can really use both dimensions.
+- No clones → your `β` in **Step 4** is not split with anyone else.
+- Continuous submission → your OOS column in **Step 3** is dense, not full of gaps.
 
 ---
 
-## 8. Pointers in the code
+## 8. Where to look in the code
 
 | What | Where |
 |---|---|
-| Dispatch entry | `model.py` → `multi_salience()` → `loss_type == "binary"` |
-| Scorer | `model.py` → `salience_binary_prediction()` |
-| Feature selection | same function, `# --- Feature selection` block |
-| Walk‑forward segments | `_build_oos_segments()` in `model.py` |
-| Base logistic | `_fit_base_logistic()` in `model.py` |
-| Meta ElasticNet | `_fit_meta_logistic_en()` in `model.py` |
-| Time weights | `_time_weights()` in `model.py` |
-| Challenge spec | `config.CHALLENGES` entries with `loss_func == "binary"` |
+| Main scorer | `model.py` → `salience_binary_prediction()` |
+| Feature‑selection loop | same function, block labeled `# --- Feature selection` |
+| Walk‑forward segment builder | `_build_oos_segments()` in `model.py` |
+| Per‑miner base logistic | `_fit_base_logistic()` in `model.py` |
+| Meta ElasticNet logistic | `_fit_meta_logistic_en()` in `model.py` |
+| Challenge definitions | `config.CHALLENGES` entries with `loss_func == "binary"` |
