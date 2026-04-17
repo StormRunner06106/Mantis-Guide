@@ -60,134 +60,223 @@ That's it. You do not need book data, order flow, news, or anything fancy to sta
 
 | Letter | Meaning | Example |
 |---|---|---|
-| `T` | How many samples of history the validator has. One sample = 60 s. | `T = 1000` ≈ 17 hours of history |
+| `T` | How many samples of history the validator has. One sample = 60 s. | `T = 1000` ≈ 17 hours |
 | `H` | How many miners are in the pool. | `H = 4` miners |
 | `D` | Your embedding size. | `D = 2` for binary |
-| `AUC` | "How good is a classifier at ranking positives above negatives?" `0.5` = random, `1.0` = perfect. | `AUC = 0.62` means better than random |
+| `AUC` | "How often does a classifier rank an up‑day higher than a down‑day?" `0.5` = random, `1.0` = perfect. | `AUC = 0.62` means better than random |
 
-That's the whole vocabulary. Everything else is a side effect.
+That's the whole vocabulary. Everything else will be defined **right where it's used** in the example below.
 
 ---
 
-## 5. Validation logic — a worked example
+## 5. Validation logic — a worked example, end to end
 
-Let's invent **four virtual miners** and run them through the real validator code step by step.
+We'll invent 4 miners and walk through every single data structure the validator builds. At every step I'll say exactly **what the structure is, what shape it has, and where its numbers come from** — no symbols pulled out of thin air.
 
-### Setup
+### Setup — meet the miners
 
-- Ticker: `ETH`. Horizon: 1 hour (60 samples).
-- Validator has collected `T = 1000` samples of ETH history.
+- Ticker: `ETH`. Horizon: 1 hour (= 60 samples, because 1 sample = 60 s).
+- Validator has collected `T = 1000` samples of history.
 - Four miners submitted an embedding at every sample:
 
-| Miner | Strategy | ETH embedding at sample `t` |
+| Miner | Strategy | Their embedding at sample `t` |
 |---|---|---|
-| **Alice** | Momentum + volatility — a *real* model | `[momentum_t, vol_z_t]` |
-| **Bob**   | Random noise | `[rand(-1,1), rand(-1,1)]` |
-| **Charlie** | Lazy — never changes | `[0.0, 0.0]` |
-| **Dave** | Sybil — **copies Alice's exact numbers** | `[momentum_t, vol_z_t]` (identical to Alice) |
+| **Alice** | Momentum + volatility — a *real* model | `[momentum(t), vol_z(t)]` — varies per sample |
+| **Bob**   | Random noise | `[rand(), rand()]` — different every sample |
+| **Charlie** | Lazy — always the same | `[0.0, 0.0]` — never changes |
+| **Dave** | Sybil — copies Alice | Literally Alice's `[x₁, x₂]` — identical |
 
-Suppose the first 1000 samples really did happen like this:
+### The raw book the validator has collected
 
-- Price went up over the next hour **540 times** → `y = 1`.
-- Price went down or stayed flat **460 times** → `y = 0`.
+Before any math happens, the validator's SQLite database holds these columns for each of the 1000 samples:
 
-### Step 1 — Build the input matrix
+| `t` | ETH price at `t` | Alice's embedding | Bob's embedding | Charlie's | Dave's (= Alice) |
+|---:|---:|---|---|---|---|
+| 0   | 3050.12 | `[ 0.30, -0.10]` | `[ 0.44, -0.87]` | `[0, 0]` | `[ 0.30, -0.10]` |
+| 1   | 3051.88 | `[ 0.22,  0.05]` | `[-0.12,  0.61]` | `[0, 0]` | `[ 0.22,  0.05]` |
+| 2   | 3050.55 | `[-0.05,  0.12]` | `[ 0.77, -0.34]` | `[0, 0]` | `[-0.05,  0.12]` |
+| …   | … | … | … | … | … |
+| 999 | 3082.10 | `[ 0.12, -0.22]` | `[-0.66,  0.28]` | `[0, 0]` | `[ 0.12, -0.22]` |
 
-The validator stacks everyone's embeddings into a big array:
+### Deriving the label column `y`
+
+For every sample `t` (where `t + 60` is still in range), the validator computes:
 
 ```
-X has shape (T=1000 samples, H=4 miners, D=2 features)
-y has shape (1000,)  →  540 ones, 460 zeros
+return(t) = (price[t + 60] − price[t]) / price[t]
+y[t]      = 1  if return(t) > 0  else 0
 ```
 
-Sanity checks the validator does:
-- `T ≥ 500`? Yes. ✓
-- Are both `0` and `1` present in `y`? Yes. ✓
+Example: `price[0] = 3050.12`, `price[60] = 3053.88` → return = +0.001 → `y[0] = 1` (up).
 
-If either fails, it just returns `{}` — no salience computed this round.
+After this, `y` is a column of **1000 zeros and ones**. Let's say 540 ones, 460 zeros.
 
-### Step 2 — Feature selection (who survives?)
+---
 
-The validator asks: *"Can miner j's two numbers, on their own, predict direction better than random?"*
+### Data structure #1 — the input matrix `X` and label vector `y` *(Step 1)*
 
-For **each miner independently**:
+The validator reshapes the raw book into one tidy tensor called `X`:
 
-1. Split `T` in half → first 500 samples = **train**, last 500 samples = **test**.
-2. Fit a tiny L2 logistic regression using only that miner's 2 features on the train half.
-3. Score the test half. Compute **AUC**.
+- **`X`**: a 3‑D array of shape `(T=1000, H=4, D=2)`.
+  - `X[t, j, :]` = miner `j`'s 2‑number embedding at sample `t`.
+  - So `X[5, 0, :]` = Alice's embedding at sample 5.
+- **`y`**: a 1‑D array of shape `(1000,)`, full of 0s and 1s as derived above.
 
-Hypothetical AUC results:
+Sanity guards (if any fail → scorer returns `{}` and skips):
+- `T ≥ 500`? ✓
+- Both classes present in `y`? ✓
 
-| Miner | AUC on test half | Pass? |
+---
+
+### Data structure #2 — per‑miner AUC scores *(Step 2, feature selection)*
+
+The validator now asks, for each miner separately: *"Can this one miner's 2 numbers predict direction at all?"*
+
+Procedure for each miner `j`:
+
+1. Split the timeline in half: rows `0..499` = **train**, rows `500..999` = **test**.
+2. Fit a tiny logistic regression using **only miner j's embedding columns**:
+   ```
+   score = β₀ + β₁ · x₁ + β₂ · x₂
+   ```
+   Training finds the three `β`s that best match the train‑half labels.
+3. Apply those `β`s to the test half → a score for every test row.
+4. Compute **AUC** = fraction of (up‑row, down‑row) pairs where the up‑row's score is higher.
+
+Result:
+
+| Miner | Test‑half AUC | Keep? |
 |---|---:|---|
-| **Alice**   | **0.62** | ✓ beats 0.5 → **survives** |
-| **Bob**     | 0.49 | ✗ worse than random → **dropped** |
-| **Charlie** | 0.50 | ✗ (constants can't classify) → **dropped** |
-| **Dave**    | **0.62** | ✓ (identical to Alice) → **survives** |
+| **Alice**   | **0.62** | ✓ beats 0.5 → survives |
+| Bob     | 0.49 | ✗ worse than random → dropped |
+| Charlie | 0.50 | ✗ constant, no signal → dropped |
+| **Dave**    | **0.62** | ✓ identical to Alice → survives |
 
-Rule in code: keep the **top 50 miners with AUC > 0.5**. Here only 2 survive: **Alice and Dave**.
+**Two miners survive: Alice and Dave.** Everyone else gets `0` salience and is ignored from here on.
 
-> Intuition: AUC = 0.62 means *"If you pick one random sample where the price went up, and one where it went down, Alice's prediction ranks the up‑one higher **62% of the time**."* That's a real, small edge — plenty to survive.
+> AUC reminder: 0.62 means *"Pick one random up‑day and one random down‑day from the test half; Alice's score is higher on the up‑day 62% of the time."*
 
-### Step 3 — Walk‑forward out‑of‑sample predictions
+---
 
-Now for every surviving miner, the validator builds a column of **honest, never‑seen‑before predictions** across the timeline. This is the "walk‑forward" part.
+### Data structure #3 — the OOS score matrix `X_oos` *(Step 3)*
 
-It chops the timeline into segments and, for each segment, *retrains* each miner's tiny logistic using only past data, with a **60‑sample embargo** (an hour gap) before the test window:
+This is the table you asked about. Let me introduce it properly.
 
-```
-Segment 1:  TRAIN on samples 0..3999         →  TEST on 4060..8000
-Segment 2:  TRAIN on samples 0..7999         →  TEST on 8060..12000
-Segment 3:  TRAIN on samples 0..11999        →  TEST on 12060..16000
-...
-```
+**What is `X_oos`?**
 
-With our toy `T = 1000` only one short segment fits, but the principle is the same. For Alice, the validator might produce 940 out‑of‑sample scores like:
+`X_oos` is a **brand new matrix** the validator builds in Step 3. It does **not** contain embeddings. It contains **scores** produced by each surviving miner's tiny logistic regression, but produced **honestly** — meaning: the score at row `t` was generated by a mini‑model that was trained only on data from *before* `t − 60`.
 
-```
-X_oos[:, Alice]  =  [0.11, -0.35, 0.62, 0.08, ..., -0.22]   # 940 numbers
-X_oos[:, Dave ]  =  [0.11, -0.35, 0.62, 0.08, ..., -0.22]   # identical!
-```
+Shape of `X_oos`:
 
-Why the embargo? The label at sample `t` *looks 60 samples into the future*. If you trained right up to sample `t`, the model could accidentally learn from those future points. The 60‑sample gap prevents that leak.
+- **Rows:** `T = 1000` — one per sample.
+- **Columns:** one per **surviving** miner. Here that's 2 columns: Alice's and Dave's.
 
-### Step 4 — The meta‑model (the key step for fairness)
+So `X_oos[t, Alice]` = "an honest score produced for sample `t` using Alice's embedding, from a mini‑model that never saw sample `t` during training."
 
-Now the validator fits **one** final logistic regression across **all surviving miners at once**:
+`X_oos[:, Alice]` is the notation *"take every row, column Alice"* — it's Alice's whole score column (1000 numbers long, some `NaN` for the earliest samples that had no history to train on).
+
+**How each entry of `X_oos` is built — the walk‑forward loop**
+
+The validator chops the timeline into segments. For each segment, it trains Alice's tiny logistic on *everything before the embargo*, and uses that mini‑model to score the segment. With bigger histories the loop runs multiple times; with our `T = 1000` it runs just once:
 
 ```
-input  :  X_oos  (the columns from Step 3, one per surviving miner)
-target :  y      (did the price actually go up?)
-model  :  ElasticNet logistic regression (L1 + L2 penalty)
+Train Alice's tiny logistic on:  samples   0..939       (940 training rows)
+                                                           ^
+                                                           |
+                         60‑sample embargo (1 hour gap)  — prevents the future-looking label leaking into training
+                                                           |
+                                                           v
+Use that mini‑model to score:    samples 940..999        → write scores into X_oos[940..999, Alice]
 ```
 
-It learns coefficients `β` — one per miner — that say **how much to trust each miner** when mixed together.
+(In real data `T` is ~86 400 and the validator makes several such segments, each larger than the last; the example uses only one segment for clarity.)
 
-Here is the magic. Imagine Alice alone would get `|β| = 0.80`. Because Dave submitted the **identical** column, the L2 penalty forces the coefficient mass to **split evenly between them**:
+After this loop, `X_oos` looks like:
 
-| Miner | Coefficient `|β|` (solo) | Coefficient `|β|` (with a clone) |
+| `t` | `X_oos[t, Alice]` | `X_oos[t, Dave]` |
+|---:|---:|---:|
+| 0 …939   | `NaN` | `NaN` |  (not enough history to train on, skipped)
+| 940 | 0.11 | 0.11 |
+| 941 | -0.35 | -0.35 |
+| 942 | 0.62 | 0.62 |
+| 943 | 0.08 | 0.08 |
+| … | … | … |
+| 999 | -0.22 | -0.22 |
+
+Dave's column is **identical** to Alice's because Dave's embeddings were identical — so the tiny logistic fits the same coefficients and produces the same scores.
+
+**Why this matters:** `X_oos` is what feeds Step 4. If the validator just used raw embeddings, a miner with 2 good features could look twice as strong as a miner with 1 equally‑good feature. By converting every miner to a single scalar **score per sample**, all miners are put on the same axis — "one number per miner per sample" — and the meta‑model can compare them fairly.
+
+---
+
+### Data structure #4 — the meta‑model coefficients `β` *(Step 4)*
+
+Now the validator fits **one final** logistic regression, but this time:
+
+- **Features:** the columns of `X_oos` (Alice's column + Dave's column) → a matrix of shape `(60 usable rows, 2 miners)`.
+- **Target:** `y[940..999]` — did the price actually go up?
+- **Model:** ElasticNet logistic, i.e. logistic regression with a combined L1+L2 penalty.
+- **What it learns:** one coefficient `β_j` per surviving miner.
+
+The model written out:
+
+```
+prediction(t) = sigmoid(  β₀
+                        + β_Alice · X_oos[t, Alice]
+                        + β_Dave  · X_oos[t, Dave]  )
+```
+
+Each `β_j` answers: *"Given that the other miners' columns are already in the model, how much does miner `j`'s column still shift the answer?"*
+
+Here's the Sybil‑defense demonstration with numbers:
+
+- If Alice had been **alone** (no Dave), the model would have settled on roughly `β_Alice = 0.80`.
+- With Dave's column being **a perfect copy**, the L2 penalty says "you're the same thing, so split the credit equally" → `β_Alice = 0.40`, `β_Dave = 0.40`.
+
+| Miner | `|β|` if alone | `|β|` with identical clone |
 |---|---:|---:|
 | Alice | 0.80 | **0.40** |
 | Dave (clone) | — | **0.40** |
 
-Two clones do **not** earn twice as much — together they earn what one Alice would have earned. **That is the Sybil defense.**
+Two copies of the same signal earn **together** exactly what one original would have earned. Three copies → 0.27 each. Ten copies → 0.08 each. That is the only reason Sybil cloning does not pay.
 
-The L1 part of the penalty drives uninformative miners' coefficients to **exactly zero** (so even if Bob had sneaked through, his `β` would go to 0).
+(The L1 half of the penalty separately pushes any useless column's coefficient to exactly `0` — so even if Bob had slipped through Step 2, the meta‑model would zero him out.)
 
-### Step 5 — Turn coefficients into salience
+---
 
-Take absolute values, normalize so they sum to 1:
+### Data structure #5 — the final salience dictionary *(Step 5)*
+
+Take absolute values of the meta‑coefficients, normalize so they sum to 1:
 
 ```
-imp["Alice"] = 0.40
-imp["Dave"]  = 0.40
-# --- sum = 0.80, divide each by 0.80 ---
-salience = {"Alice": 0.5, "Dave": 0.5}
+|β_Alice| = 0.40
+|β_Dave|  = 0.40
+sum       = 0.80
+
+salience = {
+    "Alice": 0.40 / 0.80 = 0.5,
+    "Dave" : 0.40 / 0.80 = 0.5,
+}
 ```
 
-Bob, Charlie, and every miner who didn't survive feature selection → **0**.
+Bob, Charlie, and every miner who didn't survive Step 2 → not in this dict → **0**.
 
-This dict is the binary‑challenge salience for `ETH`. The validator repeats the whole process for each of the 5 tickers, multiplies each dict by `weight = 1.0`, averages them, EMA‑smooths, and pushes on‑chain.
+This dict is the binary‑challenge salience for ETH. The whole pipeline is then repeated for each of the other 4 tickers (CADUSD, NZDUSD, CHFUSD, XAGUSD); each resulting dict is multiplied by `weight = 1.0`, averaged together, EMA‑smoothed, and pushed on‑chain as final weights.
+
+---
+
+### The five data structures in one picture
+
+```mermaid
+graph TD
+    Raw["Raw book<br/>(prices + embeddings<br/>1000 rows)"] --> X["Step 1: X (1000 × 4 × 2)<br/>+ y (1000,)"]
+    X --> AUC["Step 2: AUC per miner<br/>Alice 0.62 ✓ / Bob 0.49 ✗<br/>Charlie 0.50 ✗ / Dave 0.62 ✓"]
+    AUC --> Xoos["Step 3: X_oos<br/>(1000 rows × 2 survivor columns)<br/>honest out-of-sample scores"]
+    Xoos --> Beta["Step 4: meta-model coefficients<br/>|β_Alice| = 0.40<br/>|β_Dave|  = 0.40"]
+    Beta --> Sal["Step 5: salience dict<br/>{Alice: 0.5, Dave: 0.5}"]
+```
+
+That's the **entire** binary scorer. Every other challenge in this repo is a variation of the same 5‑structure pipeline.
 
 ---
 
